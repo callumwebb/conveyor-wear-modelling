@@ -1,0 +1,670 @@
+---
+title: "Modelling"
+output: html_notebook
+---
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(grid)
+library(gridExtra)
+library(ggpubr)
+library(randomForest)
+library(pdp)
+```
+
+## Introduction
+
+This notebook reproduces the predictive modelling described in the paper *Developing and evaluating predictive conveyor belt wear models*.
+The code for the model evaluation framework including our cross-validation design, variable importance, and partial dependence plots is covered.
+
+While we can publish the code for our methodology, we cannot share the proprietary data. 
+This also precludes us from sharing the data preparation and exploration code.
+
+In lieu of this, we will describe the structure of the data so that our methodology can be applied to similar supervised learning problems.
+
+
+## Data
+
+The file data/model-data.rds is a data frame with the following structure:
+
+* 660 rows
+* 16 columns
+
+| column             | class     | description                                                           |
+|--------------------|-----------|-----------------------------------------------------------------------|
+| pool               | integer   | uniquely identifies belt                                              |
+| wear_type          | character | "mean" or "max" - type of wear rate metric                            |
+| metric             | character | "mm/MT" or "mm/week" - throughput or time based wear rate             |
+| rate               | numeric   | wear rate value                                                       |
+| r2                 | numeric   | r squared value of wear rate estimate                                 |
+| std_err            | numeric   | standard error of wear rate estimate                                  |
+| belt_width_mm      | integer   | belt width [mm]                                                       |
+| belt_strength_kNpm | integer   | belt strength [kN/m]                                                  |
+| conveyor_duty      | character | "reclaimer", "shiploader", "stacker", "transfer", or "yard"           |
+| belt_speed_ms      | numeric   | belt speed [m/s]                                                      |
+| belt_length_m      | integer   | belt length [m]                                                       |
+| load_frequency     | numeric   | load frequency [Hz]                                                   |
+| conveyor_id        | character | the conveyor the belt was installed on                                |
+| drop_height_m      | numeric   | vertical distance between feeding and receiving pulleys               |
+| perc_fines         | numeric   | percentage of conveyed product made up of "fines"                     |
+| position           | integer   | transverse position of maximum wear rate, NA when wear_type is "mean" |
+
+The table contains wear rate values for all four metrics defined in the paper, but only max wear rate (mm/MT) is used.
+
+```{r}
+wear_data <- readRDS("data/model-data.rds") %>%
+  mutate(conveyor_duty = as.factor(conveyor_duty))
+```
+
+Subset the modelling table to carry only the worst case wear rate (mm/Mt) forward for modelling.
+
+```{r}
+wear_util_max <- wear_data %>%
+  filter(metric == "mm/MT",
+         wear_type == "max") %>%
+  arrange(pool)
+```
+
+## Cross-validation functions
+
+```{r}
+#' Generate cross-validation folds
+#'
+#' Each element of the returned list is a cross-validation partition or "fold",
+#' and the union of all the partitions is 1:nrow(model_data).
+#' Ensures that each conveyor_duty appears in at least two partitions, and 
+#' that observations from the same conveyor are allocated to the same fold.
+#' 
+#' @param model_data the modelling data
+#' @param k number of folds for cross validation
+#'
+#' @return a list of length k, where each element is a vector of row indexes
+#          into model_data 
+generate_folds <- function(model_data, k = 10) {
+  valid_assignment <- FALSE
+  
+  while (!valid_assignment) {
+    # Get all conveyor ids in random order
+    conveyors <- unique(model_data$conveyor_id) %>%
+      sample()
+  
+    # Form a dataframe mapping conveyors to partitions by recycling 1:k
+    assignment <- data.frame(
+      conveyor_id = conveyors,
+      fold = rep_len(1:k, length(conveyors)),
+      stringsAsFactors = FALSE
+    )
+    
+    # Check the assignment is valid
+    # Currently, we only need to check that each conveyor_duty value 
+    # appears in at least two different folds
+    assignment <- model_data %>%
+      left_join(assignment, by = "conveyor_id")
+    
+    valid_duty <- all(
+      assignment %>%
+        group_by(conveyor_duty) %>%
+        summarise(n_folds = length(unique(fold))) %>%
+        pull(n_folds) > 1
+      )
+
+    valid_assignment <- valid_duty
+  }
+  
+  # Sort the row indices in each fold to simplify comparisons between folds 
+  assignment %>% 
+    mutate(index = row_number()) %>%
+    group_by(fold) %>%
+    arrange(fold) %>%
+    summarise(indexes = list(sort(index))) %>%
+    pull(indexes) %>%
+    setNames(paste0("fold_", 1:length(.)))
+}
+```
+
+
+```{r}
+#' Repeated cross validation
+#'
+#' Nests the result of generate_folds into another list of n repeats
+#'
+#' @param model_data modelling data
+#' @param n number of cross validation repeats
+#' @param k number of cross validaion folds
+#'
+#' @return a list of length n, where each element is the result of 
+#'         a call to generate_folds(model_data, k)
+repeated_folds <- function(model_data, n = 5, k = 10) {
+  repeats <- vector("list", n)
+  for (i in seq_len(n)) {
+    repeats[[i]] <- generate_folds(model_data, k)
+  }
+  setNames(repeats, paste0("repeat_", 1:n))
+}
+```
+
+Apply our functions to generate training/test partitions for repeated CV.
+
+```{r}
+k <- 10
+n_reps <- 100
+set.seed(1)
+cv_folds <- repeated_folds(wear_util_max, n = n_reps, k = k)
+```
+
+
+## Model evaluation functions
+
+```{r}
+#' Evaluate a modelling approach using repeated cross validation
+#'
+#' Generates a data frame that is convenient for examining errors.
+#' model_fun must be a function that takes a single data frame of training 
+#' data, and returns a model that can generate predictions on a new data 
+#' frame using the predict() method
+#'
+#' @param model_data modelling data
+#' @param model_fun function to fit a model to model_data
+#' @param cv_folds The result of repeated_folds(model_data)
+#'
+#' @return a data frame that records the predicted and actual values for 
+#'         every observation in each repeat and fold. Predicted values
+#'         are always taken from the test partition.        
+evaluate_model <- function(model_data, model_fun, cv_repeated_indexes) {
+  # we want a dataframe of (repeat, fold, pool, actual, predicted, error)
+  results <- purrr::map_df(cv_repeated_indexes, function(cv_iteration) {
+    purrr::map_df(cv_iteration, function(fold_indexes) {
+      test_idx <- unlist(fold_indexes)
+      test_df <- model_data[test_idx, ]
+      train_df <- model_data[-test_idx, ]
+      
+      mdl <- model_fun(train_df)
+      tibble(
+        pool = test_df$pool,
+        actual = test_df$rate,
+        predicted = predict(mdl, test_df),
+        error = actual - predicted
+      )
+    }, .id = "fold")
+  }, .id = "repeat")
+  results
+}
+```
+
+```{r}
+#' Summarises the result of evaluate_model
+#' 
+#' Produces a single-row data frame that includes the following performance
+#' summaries (on unseent test data): mean RMSE, median RMSE, RMSE std. dev.,
+#' mean R2, median R2, R2 std. dev.
+#'
+#' RMSE and R2 values are first calculated for each (repeat, fold) pair, and
+#' then aggregated.
+#'
+#' @param errors_df the result of evalute_model 
+#'
+#' @return a performance summary
+summarise_errors <- function(errors_df) {
+  errors_df %>% 
+    group_by(`repeat`, fold) %>% 
+    summarise(
+      rmse = sqrt(mean(error^2)),
+      r2 = 1 - sum(error^2) / ((n() - 1) * var(actual)),
+    ) %>% 
+    ungroup() %>% 
+    summarise(
+      rmse_mean = mean(rmse),
+      rmse_med = median(rmse),
+      rmse_sd = sd(rmse),
+      r2_mean = mean(r2),
+      r2_med = median(r2),
+      r2_sd = sd(r2),
+    )
+}
+```
+
+## Models
+
+### "Null" model (intercept only)
+
+```{r}
+# variable names
+y <- "rate"
+xs <- c(
+  "belt_width_mm", 
+  "belt_strength_kNpm", 
+  "conveyor_duty", 
+  "belt_speed_ms", 
+  "belt_length_m", 
+  "load_frequency", 
+  "drop_height_m",
+  "perc_fines"
+)
+ids <- "pool"
+
+# null model
+model_null <- function(train_df) {
+  lm(rate ~ 1, data = train_df)
+}
+
+errors_null <- evaluate_model(wear_util_max[, c(y, xs, ids)], model_null, cv_folds)
+null_summary <- summarise_errors(errors_null)
+null_summary
+```
+
+### Linear regression
+
+```{r}
+model_lm <- function(train_df) {
+  lm(reformulate(xs, y), data = train_df)
+}
+
+errors_lm <- evaluate_model(wear_util_max[, c(y, xs, ids)], model_lm, cv_folds)
+lm_summary <- summarise_errors(errors_lm)
+lm_summary
+```
+
+Percent improvement over null:
+
+```{r}
+(null_summary$rmse_mean - lm_summary$rmse_mean) / null_summary$rmse_mean
+```
+
+### Random forest
+
+We would like to tune the parameter mtry (number of variables randomly sampled as candidates at each split).
+We also have to choose the number of trees to grow.
+We don't tune the number of trees, but simply pick a high enough value such that the OOB error has plateaued.
+
+#### OOB error as function of n_tree
+
+This analysis suggests that the error will not be reduced further after 1000 trees.
+
+```{r, fig.width = 8, fig.height = 4}
+set.seed(1)
+n_reps <- 100 # number of repeats to average results over
+tree_min <- 20
+tree_max <- 1500
+mses_default <- replicate(
+  n_reps,
+  randomForest(rate ~ ., data = wear_util_max[, c(xs, y)], ntree = tree_max)$mse
+)
+
+mean_mses_d <- rowMeans(mses_default)[tree_min:tree_max]
+
+p_data <- data.frame(
+  n_tree = tree_min:tree_max,
+  mse = mean_mses_d
+)
+
+p_ntrees <- ggplot(p_data, aes(x = n_tree, y = mse)) +
+  geom_line() +
+  scale_x_continuous(name = "number of trees") +
+  scale_y_continuous(name = "MSE", limits = c(0.027, 0.030)) +
+  ggpubr::theme_pubclean(base_size = 8) +
+  theme(axis.title.y = element_text(angle = 0, vjust = 0.5))
+
+ggsave("n-trees.pdf", p_ntrees, width = 8, height = 3.5, units = "cm", device = cairo_pdf)
+```
+
+We want to retain the optimal mtry parameter value found in each training partition to 
+consider its stability.
+
+```{r}
+mtry_optimal <- vector("numeric")
+ntree <- 1000
+
+model_rf <- function(train_df) {
+  x <- train_df[, xs]
+  y <- pull(train_df, rate)
+  sink(tempfile()) 
+  mtry <- tuneRF(
+    x, y, 
+    ntreeTry = ntree, 
+    doBest = FALSE, 
+    trace = FALSE, plot = FALSE
+  )
+  mtry <- mtry[which.min(mtry[, 2]), 1]
+  mtry_optimal <<- c(mtry_optimal, mtry)
+  model <- randomForest(
+    x = x, y = y, 
+    ntree = ntree, 
+    mtry = mtry
+  )
+  sink()
+  model
+}
+
+y <- "rate"
+set.seed(1) # for repeatability
+errors_rf <- evaluate_model(wear_util_max[, c(y, xs, ids)], model_rf, cv_folds)
+rf_summary <- summarise_errors(errors_rf)
+rf_summary
+```
+
+```{r}
+table(mtry_optimal)
+```
+
+Roughly 80% of the time, the optimal value was 1. 
+We don't necessarily need to set the value to 1 in practice; CV is testing the performance resulting from tuning mtry automatically.
+
+We re-checked the error as a function of n_tree with mtry set to 1, which showed a similar shaped curve with a slightly lower plateau error value.
+
+Percent improvement over null model:
+
+```{r}
+(null_summary$rmse_mean - rf_summary$rmse_mean) / null_summary$rmse_mean
+```
+
+### Comparing RF and LR errors
+
+Using the standard deviation of mean RMSE values may be misleading when trying to compare the performance of the two algorithms, because the variance of the CV statistic is not just due to the choice of algorithm, but also the test and training sets.
+
+To illustrate this problem, consider running the same linear regression algorithm through the CV process twice. Both models would produce identical mean RMSE values with non-zero variance, suggesting a non-zero probability that their performance differs, even when we know that they must perform identically. 
+
+Instead, let's look calculate the *mean difference* for each test set, and also calculate its standard deviation.
+
+```{r}
+errors_comparison <- errors_lm %>% 
+  select(
+    `repeat`,
+    fold,
+    pool,
+    error_lm = error
+  ) %>% 
+  left_join(
+    errors_rf %>% 
+      select(
+        `repeat`,
+        fold,
+        pool,
+        error_rf = error
+      ),
+    by = c("repeat", "fold", "pool")
+  )
+
+comp_summary <- errors_comparison %>% 
+  group_by(`repeat`, fold) %>% 
+  summarise(
+    rmse_lm = sqrt(mean(error_lm^2)),
+    rmse_rf = sqrt(mean(error_rf^2))
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    error_diff = rmse_lm - rmse_rf
+  ) %>% 
+  summarise(
+    error_diff_mean = mean(error_diff),
+    error_diff_sd = sd(error_diff)
+  )
+
+comp_summary
+```
+
+
+## Variable importance
+
+We will do permutation importance inside the CV loop to understand importance with respect to generalisation error.
+With each test fold, permute each column in turn and store the resulting decrease in prediction accuracy.
+We go to this trouble because the 'out-of-bag' data for random forest is not aligned with our cross-validation constraints.
+A data point that is out-of-bag for a tree may still come from the same conveyor.
+
+Another advantage of doing it in the CV process is that we can inspect the stability of the variable importance measures.
+
+For computational efficiency, we fix the mtry parameter to 1 for this process. 
+
+```{r}
+#' Permutation variable importance
+#'
+#' Calculate variable importance using the permutation method within our
+#' cross-validation framework.
+#'
+#' @param model_data modelling data
+#' @param model_fun function to fit a model to model_data
+#' @param cv_repeated_indexes the result of repeated_folds(model_data)
+#' @param vars character vector of variables to consider
+#' @param n_perms number of permutations to average results over within each 
+#'                test partition
+#'
+#' @return a data frame that records the change in rmse (and mse) observed after
+#'         permuting each variable. 
+#'         One row per (repeat, fold, variable, perm) tuple.
+var_importance <- function(model_data, model_fun, cv_repeated_indexes,
+                           vars, n_perms) {
+  # The desired output is a dataframe with columns:
+  # repeat, fold, perm, variable, error, error_delta
+  # where error is the prediction error (without permutation),
+  # and error_delta is the change in error after randomly permuting
+  # the values for that variable.
+  results <- purrr::map_df(cv_repeated_indexes, function(cv_iteration) {
+    purrr::map_df(cv_iteration, function(fold_indexes) {
+      test_idx <- unlist(fold_indexes)
+      test_df <- model_data[test_idx, ]
+      train_df <- model_data[-test_idx, ]
+      
+      # Fit model and calculate rmse of non-shuffled data
+      mdl <- model_fun(train_df)
+      predicted <- predict(mdl, test_df)
+      actual <- test_df$rate 
+      mse <- mean((actual - predicted)^2)
+      rmse <- sqrt(mse)
+      
+      purrr::map_df(vars, function(var) {
+        # for each variable, shuffle the values in that column
+        # n_perms times and cacluate rmse of shuffled data
+        shuffled <- replicate(n_perms, sample(test_df[[var]]), simplify = FALSE)
+        test_perm <- test_df[rep(1:nrow(test_df), n_perms), ]
+        test_perm[[var]] <- unlist(shuffled)
+        test_perm %>% 
+          mutate(
+            perm = rep(1:n_perms, each = nrow(test_df)),
+            predicted_perm = predict(mdl, test_perm),
+          ) %>% 
+          group_by(perm) %>% 
+          summarise(
+            mse_perm = mean((actual - predicted_perm)^2),
+            rmse_perm = sqrt(mse_perm),
+            rmse = rmse,
+            rmse_delta = rmse_perm - rmse,
+            mse_delta = mse_perm - mse,
+            mse_inc = rmse_delta / mse
+          )
+      }, .id = "variable")
+    }, .id = "fold")
+  }, .id = "repeat")
+  results %>% mutate(variable = vars[as.integer(variable)])
+}
+```
+
+
+```{r}
+n_perms <- 5
+
+# random forest model function with m_try set to 1
+model_rf_fixed <- function(train_df) {
+  x <- train_df[, xs]
+  y <- pull(train_df, rate)
+  model <- randomForest(
+    x = x, y = y, ntree = ntree, mtry = 1
+  )
+  model
+}
+
+set.seed(1)
+imp <- var_importance(
+  wear_util_max[, c(y, xs, ids)], model_rf_fixed, 
+  cv_folds, xs, n_perms
+)
+```
+
+Summarising the result of var_importance. 
+*drmse and dmse refer to the change (delta) in error introduced by permuting that variable*
+
+```{r}
+var_imp <- imp %>% 
+  group_by(variable) %>%
+  summarise(
+    mean_drmse = mean(rmse_delta),
+    mean_dmse = mean(mse_delta),
+    sd_drmse = sd(rmse_delta),
+    sd_rmse = sd(mse_delta)
+) %>% 
+  arrange(desc(mean_drmse))
+
+var_imp 
+```
+
+Presenting this in a chart:
+
+```{r}
+ordering <- var_imp$variable
+
+p_data <- imp %>% 
+  mutate(variable = factor(variable, levels = ordering)) %>% 
+  group_by(variable) %>% 
+  summarise(
+    weight = mean(rmse_delta), #/ sd(rmse_delta)
+    weight_min = mean(rmse_delta) - sd(rmse_delta) / 2,
+    weight_max = mean(rmse_delta) + sd(rmse_delta) / 2
+  )
+
+p_var_imp <- ggplot(p_data, aes(x = variable, y = weight)) +
+  geom_linerange(aes(ymin = weight_min, ymax = weight_max), size = 0.4) +
+  geom_point(size = 0.75) +
+  scale_x_discrete(
+    limits = rev(levels(p_data$variable)),
+    labels = c(
+      load_frequency = "load frequency",
+      conveyor_duty = "conveyor duty",
+      belt_length_m = "belt length",
+      belt_width_mm = "belt width",
+      drop_height_m = "drop height",
+      belt_speed_ms = "belt speed",
+      perc_fines = "% fines",
+      belt_strength_kNpm = "belt strength"
+    )
+  ) +
+  scale_y_continuous(name = expression(Delta~"RMSE")) +
+  coord_flip() +
+  ggpubr::theme_pubclean(base_size = 8) +
+  theme(
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(size = rel(1.1)),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(linetype = "dotted", color = "grey")
+  )
+
+ggsave("variable-importance.pdf", p_var_imp, width = 8, height = 4, units = "cm", device = cairo_pdf)
+```
+
+## Partial dependence plots
+
+```{r}
+set.seed(1)
+rf <- randomForest(
+  x = wear_util_max[, xs],
+  y = wear_util_max$rate,
+  mtry = 1, strata = wear_util_max$conveyor_id,
+  ntree = 1000
+)
+
+vars <- c(
+  "load_frequency",
+  "belt_length_m",
+  "conveyor_duty",
+  "belt_width_mm"
+)
+
+p_data_deps <- purrr::map(
+  vars, ~pdp::partial(
+    rf,
+    pred.var = .x,
+    train = wear_util_max[, xs],
+    plot.engine = "ggplot2"
+  )
+) %>% setNames(vars)
+
+# Rearrange duty factors in decreasing order
+p_data_deps$conveyor_duty <- p_data_deps$conveyor_duty %>% 
+  arrange(desc(yhat)) %>% 
+  mutate(conveyor_duty = factor(conveyor_duty ,levels = as.character(conveyor_duty)))
+
+ylims <- c(0.25, 0.5)
+ybreaks <- seq(0.25, 0.5, by = 0.05)
+
+p_load_freq <- ggplot(p_data_deps[["load_frequency"]], aes(x = load_frequency, y = yhat)) +
+  geom_line(size = 0.5) +
+  ggpubr::theme_pubclean(base_size = 8) +
+  scale_y_continuous(limits = ylims) +
+  scale_x_continuous(name = "load frequency (Hz)") +
+  theme(
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.margin = ggplot2::margin(0.5, 0, 0.2, 0.3, "cm")
+  )
+
+p_length <- ggplot(p_data_deps[["belt_length_m"]], aes(x = belt_length_m, y = yhat)) +
+  geom_line(size = 0.5) +
+  ggpubr::theme_pubclean(base_size = 8) +
+  scale_y_continuous(limits = ylims) +
+  scale_x_continuous(name = "belt length (m)") +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.margin = ggplot2::margin(0.5, 0.25, 0.2, 0.2, "cm")
+  )
+
+p_duty <- ggplot(p_data_deps[["conveyor_duty"]], aes(x = conveyor_duty, y = yhat)) +
+  geom_point(size = 1) +
+  ggpubr::theme_pubclean(base_size = 8) +
+  scale_y_continuous(limits = ylims, breaks = ybreaks) +
+  scale_x_discrete(
+    name = "conveyor duty"
+  ) +
+  theme(
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.margin = ggplot2::margin(0.5, 0, 0, 0.3, "cm")
+  )
+
+p_width <- ggplot(p_data_deps[["belt_width_mm"]], aes(x = belt_width_mm, y = yhat)) +
+  geom_line(size = 0.5) +
+  ggpubr::theme_pubclean(base_size = 8) +
+  scale_y_continuous(limits = ylims, breaks = ybreaks) +
+  scale_x_continuous(name = "belt width (mm)") +
+  theme(
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.margin = ggplot2::margin(0.5, 0.25, 0.66, 0.2, "cm") # manual hack for alignment
+  )
+
+p <- cowplot::plot_grid(
+  p_load_freq, p_length, p_duty, p_width,
+  ncol = 2,
+  rel_heights = c(1, 1.2),
+  rel_widths = c(1, 0.95),
+  labels = c("load frequency (Hz)", "belt length (m)", "conveyor duty", "belt width (mm)"),
+  label_size = 8,
+  label_fontface = "plain",
+  label_x = 0.1,
+  hjust = 0
+)
+
+y_grob <- textGrob(
+  "wear rate prediction (mm/Mt)",
+  gp = gpar(fontsize = 8), rot = 90
+)
+
+p_combined <- arrangeGrob(p, left = y_grob)
+ggsave("partial-dep-plot.pdf", p_combined, width = 9, height = 6.8, units = "cm")
+```
+
