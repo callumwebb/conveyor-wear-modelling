@@ -283,7 +283,7 @@ This analysis suggests that the error will not be reduced further after 1000 tre
 ```{r, fig.width = 8, fig.height = 4}
 set.seed(1)
 n_reps <- 100 # number of repeats to average results over
-tree_min <- 20
+tree_min <- 15
 tree_max <- 1500
 mses_default <- replicate(
   n_reps,
@@ -302,9 +302,13 @@ p_ntrees <- ggplot(p_data, aes(x = n_tree, y = mse)) +
   scale_x_continuous(name = "number of trees") +
   scale_y_continuous(name = "MSE", limits = c(0.027, 0.030)) +
   ggpubr::theme_pubclean(base_size = 8) +
-  theme(axis.title.y = element_text(angle = 0, vjust = 0.5))
+  theme(
+    axis.title.y = element_text(angle = 0, vjust = 0.5),
+    axis.ticks.y = element_blank()
+  )
 
 ggsave("n-trees.pdf", p_ntrees, width = 8, height = 3.5, units = "cm", device = cairo_pdf)
+p_ntrees
 ```
 
 We want to retain the optimal mtry parameter value found in each training partition to 
@@ -551,6 +555,7 @@ p_var_imp <- ggplot(p_data, aes(x = variable, y = weight)) +
   theme(
     axis.ticks.y = element_blank(),
     axis.title.y = element_blank(),
+    axis.ticks.x = element_blank(),
     axis.text.y = element_text(size = rel(1.1)),
     panel.grid.major.y = element_blank(),
     panel.grid.major.x = element_line(linetype = "dotted", color = "grey")
@@ -644,7 +649,7 @@ p_width <- ggplot(p_data_deps[["belt_width_mm"]], aes(x = belt_width_mm, y = yha
     axis.title.x = element_blank(),
     axis.text.y = element_blank(),
     axis.ticks.y = element_blank(),
-    plot.margin = ggplot2::margin(0.5, 0.25, 0.66, 0.2, "cm") # manual hack for alignment
+    plot.margin = ggplot2::margin(0.5, 0.25, 0.70, 0.2, "cm") # manual hack for alignment
   )
 
 p <- cowplot::plot_grid(
@@ -665,6 +670,6 @@ y_grob <- textGrob(
 )
 
 p_combined <- arrangeGrob(p, left = y_grob)
-ggsave("partial-dep-plot.pdf", p_combined, width = 9, height = 6.8, units = "cm")
+ggsave("partial-dep-plot.pdf", p_combined, width = 9, height = 6.9, units = "cm", device = cairo_pdf)
 ```
 
