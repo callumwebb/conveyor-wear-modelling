@@ -3,4 +3,5 @@
 .RData
 .Ruserdata
 *.pdf
+*.html
 .DS_Store
