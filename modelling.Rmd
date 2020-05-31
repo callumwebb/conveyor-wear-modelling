@@ -299,7 +299,7 @@ p_data <- data.frame(
 
 p_ntrees <- ggplot(p_data, aes(x = n_tree, y = mse)) +
   geom_line() +
-  scale_x_continuous(name = "number of trees") +
+  scale_x_continuous(name = "Number of trees", labels = scales::label_comma()) +
   scale_y_continuous(name = "MSE", limits = c(0.027, 0.030)) +
   ggpubr::theme_pubclean(base_size = 8) +
   theme(
@@ -539,14 +539,14 @@ p_var_imp <- ggplot(p_data, aes(x = variable, y = weight)) +
   scale_x_discrete(
     limits = rev(levels(p_data$variable)),
     labels = c(
-      load_frequency = "load frequency",
-      conveyor_duty = "conveyor duty",
-      belt_length_m = "belt length",
-      belt_width_mm = "belt width",
-      drop_height_m = "drop height",
-      belt_speed_ms = "belt speed",
-      perc_fines = "% fines",
-      belt_strength_kNpm = "belt strength"
+      load_frequency = "Load frequency",
+      conveyor_duty = "Conveyor duty",
+      belt_length_m = "Belt length",
+      belt_width_mm = "Belt width",
+      drop_height_m = "Drop height",
+      belt_speed_ms = "Belt speed",
+      perc_fines = "% Fines",
+      belt_strength_kNpm = "Belt strength"
     )
   ) +
   scale_y_continuous(name = expression(Delta~"RMSE")) +
@@ -603,7 +603,7 @@ p_load_freq <- ggplot(p_data_deps[["load_frequency"]], aes(x = load_frequency, y
   geom_line(size = 0.5) +
   ggpubr::theme_pubclean(base_size = 8) +
   scale_y_continuous(limits = ylims) +
-  scale_x_continuous(name = "load frequency (Hz)") +
+  scale_x_continuous(name = "Load frequency (Hz)") +
   theme(
     axis.title.y = element_blank(),
     axis.title.x = element_blank(),
@@ -615,13 +615,13 @@ p_length <- ggplot(p_data_deps[["belt_length_m"]], aes(x = belt_length_m, y = yh
   geom_line(size = 0.5) +
   ggpubr::theme_pubclean(base_size = 8) +
   scale_y_continuous(limits = ylims) +
-  scale_x_continuous(name = "belt length (m)") +
+  scale_x_continuous(name = "Belt length (m)", labels = scales::label_comma()) +
   theme(
     axis.title.y = element_blank(),
     axis.text.y = element_blank(),
     axis.title.x = element_blank(),
     axis.ticks.y = element_blank(),
-    plot.margin = ggplot2::margin(0.5, 0.25, 0.2, 0.2, "cm")
+    plot.margin = ggplot2::margin(0.5, 0.27, 0.2, 0.2, "cm")
   )
 
 p_duty <- ggplot(p_data_deps[["conveyor_duty"]], aes(x = conveyor_duty, y = yhat)) +
@@ -629,7 +629,7 @@ p_duty <- ggplot(p_data_deps[["conveyor_duty"]], aes(x = conveyor_duty, y = yhat
   ggpubr::theme_pubclean(base_size = 8) +
   scale_y_continuous(limits = ylims, breaks = ybreaks) +
   scale_x_discrete(
-    name = "conveyor duty"
+    name = "Conveyor duty"
   ) +
   theme(
     axis.title.y = element_blank(),
@@ -643,13 +643,13 @@ p_width <- ggplot(p_data_deps[["belt_width_mm"]], aes(x = belt_width_mm, y = yha
   geom_line(size = 0.5) +
   ggpubr::theme_pubclean(base_size = 8) +
   scale_y_continuous(limits = ylims, breaks = ybreaks) +
-  scale_x_continuous(name = "belt width (mm)") +
+  scale_x_continuous(name = "Belt width (mm)", labels = scales::label_comma()) +
   theme(
     axis.title.y = element_blank(),
     axis.title.x = element_blank(),
     axis.text.y = element_blank(),
     axis.ticks.y = element_blank(),
-    plot.margin = ggplot2::margin(0.5, 0.25, 0.70, 0.2, "cm") # manual hack for alignment
+    plot.margin = ggplot2::margin(0.5, 0.27, 0.70, 0.2, "cm") # manual hack for alignment
   )
 
 p <- cowplot::plot_grid(
@@ -657,7 +657,7 @@ p <- cowplot::plot_grid(
   ncol = 2,
   rel_heights = c(1, 1.2),
   rel_widths = c(1, 0.95),
-  labels = c("load frequency (Hz)", "belt length (m)", "conveyor duty", "belt width (mm)"),
+  labels = c("Load frequency (Hz)", "Belt length (m)", "Conveyor duty", "Belt width (mm)"),
   label_size = 8,
   label_fontface = "plain",
   label_x = 0.1,
@@ -665,7 +665,7 @@ p <- cowplot::plot_grid(
 )
 
 y_grob <- textGrob(
-  "wear rate prediction (mm/Mt)",
+  "Wear rate prediction (mm/Mt)",
   gp = gpar(fontsize = 8), rot = 90
 )
 
